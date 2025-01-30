@@ -24,6 +24,8 @@ import triton.language as tl
 from sparse_autoencoder.kernels import *
 from torch.distributed import ReduceOp
 
+from sparse_autoencoder.llm import get_acts_iter, get_stats_acts_sample
+
 RANK = int(os.environ.get("RANK", "0"))
 
 
@@ -35,12 +37,18 @@ class Comm:
     group: torch.distributed.ProcessGroup
 
     def all_reduce(self, x, op=ReduceOp.SUM, async_op=False):
+        if dist.get_world_size() == 1:
+            return
         return dist.all_reduce(x, op=op, group=self.group, async_op=async_op)
 
     def all_gather(self, x_list, x, async_op=False):
+        if dist.get_world_size() == 1:
+            return
         return dist.all_gather(list(x_list), x, group=self.group, async_op=async_op)
 
     def broadcast(self, x, src, async_op=False):
+        if dist.get_world_size() == 1:
+            return
         return dist.broadcast(x, src, group=self.group, async_op=async_op)
 
     def barrier(self):
@@ -216,15 +224,25 @@ def make_torch_comms(n_op_shards=4, n_replicas=2):
     dp_comm = Comm(group=my_replica_group)
     sh_comm = Comm(group=my_shard_group)
 
-    return ShardingComms(
+    return TRIVIAL_COMMS if world_size == 1 else ShardingComms(
         n_replicas=n_replicas,
         n_op_shards=n_op_shards,
-        dp_comm=dp_comm,
-        sh_comm=sh_comm,
-        dp_rank=my_replica_idx,
-        sh_rank=my_op_shard_idx,
+        dp_rank=0,
+        sh_rank=0,
+        dp_comm=None,
+        sh_comm=None,
         _rank=rank,
     )
+
+    # return ShardingComms(
+    #     n_replicas=n_replicas,
+    #     n_op_shards=n_op_shards,
+    #     dp_comm=dp_comm,
+    #     sh_comm=sh_comm,
+    #     dp_rank=my_replica_idx,
+    #     sh_rank=my_op_shard_idx,
+    #     _rank=rank,
+    # )
 
 
 def replica_shard_to_rank(replica_idx, shard_idx, n_op_shards):
@@ -246,7 +264,11 @@ def sharded_topk(x, k, sh_comm, capacity_factor=None):
     batch = x.shape[0]
 
     if capacity_factor is not None:
-        k_in = min(int(k * capacity_factor // sh_comm.size()), k)
+        # k_in = min(int(k * capacity_factor // sh_comm.size()), k)
+        if sh_comm is None:
+            k_in = k  # No sharding in single-GPU mode
+        else:
+            k_in = min(int(k * capacity_factor // sh_comm.size()), k)
     else:
         k_in = k
 
@@ -617,15 +639,18 @@ def init_from_data_(ae, stats_acts_sample, comms):
     ae.pre_bias.data = (
         compute_geometric_median(stats_acts_sample[:32768].float().cpu()).median.cuda().float()
     )
-    comms.all_broadcast(ae.pre_bias.data)
+
+    if dist.get_world_size() > 1:
+        comms.all_broadcast(ae.pre_bias.data)
 
     # encoder initialization (note: in our ablations we couldn't find clear evidence that this is beneficial, this is just to ensure exact match with internal codebase)
     d_model = ae.d_model
     with torch.no_grad():
-        x = torch.randn(256, d_model).cuda().to(stats_acts_sample.dtype)
+        x = torch.randn(128, d_model).cuda().to(stats_acts_sample.dtype)
         x /= x.norm(dim=-1, keepdim=True)
         x += ae.pre_bias.data
-        comms.all_broadcast(x)
+        if dist.get_world_size() > 1:
+            comms.all_broadcast(x)
         recons, _ = ae(x)
         recons_norm = (recons - ae.pre_bias.data).norm(dim=-1).mean()
 
@@ -682,7 +707,7 @@ class EmaModel:
 @dataclass
 class Config:
     n_op_shards: int = 1
-    n_replicas: int = 8
+    n_replicas: int = 1
 
     n_dirs: int = 32768
     bs: int = 131072
@@ -706,8 +731,8 @@ def main():
     comms = make_torch_comms(n_op_shards=cfg.n_op_shards, n_replicas=cfg.n_replicas)
 
     ## dataloading is left as an exercise for the reader
-    acts_iter = ...
-    stats_acts_sample = ...
+    acts_iter = get_acts_iter()
+    stats_acts_sample = get_stats_acts_sample()
 
     n_dirs_local = cfg.n_dirs // cfg.n_op_shards
     bs_local = cfg.bs // cfg.n_replicas
@@ -728,7 +753,8 @@ def main():
     mse_scale = (
         1 / ((stats_acts_sample.float().mean(dim=0) - stats_acts_sample.float()) ** 2).mean()
     )
-    comms.all_broadcast(mse_scale)
+    if dist.get_world_size() > 1:
+        comms.all_broadcast(mse_scale)
     mse_scale = mse_scale.item()
 
     logger = Logger(
